@@ -1,6 +1,19 @@
 # golang默认的http router
 
 
+我们从Golang的http router开始学习，学习下面几点：
+
+1. 分析什么是router
+
+2. 解析Go内部是如何实现router
+
+3. 分析为什么Go内部已经有了router后还会出现各种个样的router，他们提供了哪些Go内部router不能完成的功能
+
+4. 我们如何实现一个自定义的router
+
+5. 我们如何在自定义的router上面完成我们想要的各种功能：高效率、Middleware、异常捕获及处理、如何简单的完成JSON类型的返回等等
+
+
 ## DEMO
 
 首先看golang默认的http router是如何工作的。
