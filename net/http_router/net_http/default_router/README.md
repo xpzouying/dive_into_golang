@@ -1,6 +1,8 @@
 # golang默认的http router
 
 
+# Day 1
+
 我们从Golang的http router开始学习，学习下面几点：
 
 1. 分析什么是router
@@ -148,3 +150,56 @@ ServeMux是一个HTTP的multiplexer，翻译过来就是：数据选择器或者
 
 剩下的注释就是解释Golang自带的默认路由器是如何匹配各种情况的，暂时先跳过。
 
+
+
+# Day 2
+
+http注册一个http处理函数的过程为：
+
+```go
+http.HandleFunc("/foo", fooHandler)
+```
+
+查看源码为，
+
+```go
+// HandleFunc registers the handler function for the given pattern
+// in the DefaultServeMux.
+// The documentation for ServeMux explains how patterns are matched.
+func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+	DefaultServeMux.HandleFunc(pattern, handler)
+}
+```
+
+HandleFunc函数的作用就是把一个处理函数注册按照特定的模式注册给默认的DefaultServeMux。
+
+处理函数（HandlerFunc）的定义为：
+
+```go
+handler func(ResponseWriter, *Request)
+```
+
+在函数里面展示了如何把一个制定的HandlerFunc绑定到DefaultServeMux上。
+
+```go
+// HandleFunc registers the handler function for the given pattern.
+func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+    // ...
+	mux.Handle(pattern, HandlerFunc(handler))
+}
+```
+
+继续进入mux.Handle分析，
+
+```go
+// Handle registers the handler for the given pattern.
+// If a handler already exists for pattern, Handle panics.
+func (mux *ServeMux) Handle(pattern string, handler Handler) {
+    // ...
+	mux.m[pattern] = muxEntry{h: handler, pattern: pattern}
+
+	if pattern[0] != '/' {
+		mux.hosts = true
+	}
+}
+```
