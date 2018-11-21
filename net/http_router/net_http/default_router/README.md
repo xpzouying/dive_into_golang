@@ -203,3 +203,32 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 	}
 }
 ```
+
+
+Handle的作用就是把一种模式注册给http handler。
+
+其实就是把pattern对应的路径规则保存在ServeMux的map表（map[string]muxEntry）中，其中muxEntry的定义如下，
+
+```go
+type muxEntry struct {
+	h       Handler
+	pattern string
+}
+```
+
+> TODO(zouying)：
+> - 为什么map中保存了pattern，这边里面还需要再保存一次？
+> 猜测的是估计按照某种规则匹配到对应的http handler以后，还需要再按照某种规则处理一下。
+
+从这里我们了解`如何注册一个http handler到对应的pattern`了，
+
+下一步我们需要揭开的谜题就是：当来了一个请求后，找到对应的http handler的过程。
+
+以default_router/main.go为例，
+
+发起http request后，
+
+`curl -X GET http://localhost:8080/foo`，
+
+如何找到对应的`fooHandler`。
+
