@@ -573,8 +573,73 @@ func (mux *ServeMux) match(path string) (h Handler, pattern string) {
 
 从mux中，也即默认的DefaultServeMux，注册Handler map表中搜索，根据一个符合的返回。如果有多个handler都符合，那么返回path匹配最长路径的handler。
 
+
 > 在这里我们可以看到http默认的mux是不区分http方法的，所以只要路径满足，不管request method是get、post、delete，都是会进入到同一个Handler中。
 
+
+我们回顾到上面调用处理函数的地方，
+
+```go
+// ServeHTTP dispatches the request to the handler whose
+// pattern most closely matches the request URL.
+func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
+	// ...
+	h, _ := mux.Handler(r)
+	h.ServeHTTP(w, r)
+}
+```
+
+我们从mux中获取到了一个Handler h，我们是使用`h.ServeHTTP(w, r)`来调用我们定义的请求处理函数。
+
+我们定义的请求处理函数原型是：`func fooHandler(w http.ResponseWriter, r *http.Request) `
+
+并且Handler interface的定义也是下面这样，
+
+```go
+type Handler interface {
+	ServeHTTP(ResponseWriter, *Request)
+}
+```
+
+也要求Handler，也即是我们的处理函数需要满足：ServeHTTP(ResponseWriter, *Request)，然而我们的函数并没有定义ServeHTTP函数，这是怎么一回事？
+
+奇妙之处就在于注册的时候，
+
+当我们用`http.HandleFunc("/foo", fooHandler)`注册时，
+
+```go
+func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+	DefaultServeMux.HandleFunc(pattern, handler)
+}
+
+// HandleFunc registers the handler function for the given pattern.
+func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+	// ...
+	mux.Handle(pattern, HandlerFunc(handler))
+}
+```
+
+在HandleFunc中，会把我们自定义的handler（也就是fooHandler）强制类型转换为`HandlerFunc(handler)`。
+
+而HandlerFunc的定义如下，
+
+```go
+// The HandlerFunc type is an adapter to allow the use of
+// ordinary functions as HTTP handlers. If f is a function
+// with the appropriate signature, HandlerFunc(f) is a
+// Handler that calls f.
+type HandlerFunc func(ResponseWriter, *Request)
+
+// ServeHTTP calls f(w, r).
+func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
+	f(w, r)
+}
+```
+
+HandlerFunc就是为了适配自定义的函数为标准的Handler。
+
+
+-----
 
 前面的流程串一下就是：
 
