@@ -388,39 +388,10 @@ func (c *conn) serve(ctx context.Context) {
 	c.remoteAddr = c.rwc.RemoteAddr().String()
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
 	defer func() {
-		if err := recover(); err != nil && err != ErrAbortHandler {
-			const size = 64 << 10
-			buf := make([]byte, size)
-			buf = buf[:runtime.Stack(buf, false)]
-			c.server.logf("http: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
-		}
-		if !c.hijacked() {
-			c.close()
-			c.setState(c.rwc, StateClosed)
-		}
+		// 异常panic处理
 	}()
 
-	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
-		if d := c.server.ReadTimeout; d != 0 {
-			c.rwc.SetReadDeadline(time.Now().Add(d))
-		}
-		if d := c.server.WriteTimeout; d != 0 {
-			c.rwc.SetWriteDeadline(time.Now().Add(d))
-		}
-		if err := tlsConn.Handshake(); err != nil {
-			c.server.logf("http: TLS handshake error from %s: %v", c.rwc.RemoteAddr(), err)
-			return
-		}
-		c.tlsState = new(tls.ConnectionState)
-		*c.tlsState = tlsConn.ConnectionState()
-		if proto := c.tlsState.NegotiatedProtocol; validNPN(proto) {
-			if fn := c.server.TLSNextProto[proto]; fn != nil {
-				h := initNPNRequest{tlsConn, serverHandler{c.server}}
-				fn(c.server, tlsConn, h)
-			}
-			return
-		}
-	}
+	// ... tls相关的处理
 
 	// HTTP/1.x from here on.
 
@@ -434,56 +405,7 @@ func (c *conn) serve(ctx context.Context) {
 
 	for {
 		w, err := c.readRequest(ctx)
-		if c.r.remain != c.server.initialReadLimitSize() {
-			// If we read any bytes off the wire, we're active.
-			c.setState(c.rwc, StateActive)
-		}
-		if err != nil {
-			const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
-
-			if err == errTooLarge {
-				// Their HTTP client may or may not be
-				// able to read this if we're
-				// responding to them and hanging up
-				// while they're still writing their
-				// request. Undefined behavior.
-				const publicErr = "431 Request Header Fields Too Large"
-				fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
-				c.closeWriteAndWait()
-				return
-			}
-			if isCommonNetReadError(err) {
-				return // don't reply
-			}
-
-			publicErr := "400 Bad Request"
-			if v, ok := err.(badRequestError); ok {
-				publicErr = publicErr + ": " + string(v)
-			}
-
-			fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
-			return
-		}
-
-		// Expect 100 Continue support
-		req := w.req
-		if req.expectsContinue() {
-			if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
-				// Wrap the Body reader with one that replies on the connection
-				req.Body = &expectContinueReader{readCloser: req.Body, resp: w}
-			}
-		} else if req.Header.get("Expect") != "" {
-			w.sendExpectationFailed()
-			return
-		}
-
-		c.curReq.Store(w)
-
-		if requestBodyRemains(req.Body) {
-			registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
-		} else {
-			w.conn.r.startBackgroundRead()
-		}
+		// ...
 
 		// HTTP cannot have multiple simultaneous active requests.[*]
 		// Until the server replies to this request, it can't read another,
@@ -493,38 +415,175 @@ func (c *conn) serve(ctx context.Context) {
 		// But we're not going to implement HTTP pipelining because it
 		// was never deployed in the wild and the answer is HTTP/2.
 		serverHandler{c.server}.ServeHTTP(w, w.req)
-		w.cancelCtx()
-		if c.hijacked() {
-			return
-		}
-		w.finishRequest()
-		if !w.shouldReuseConnection() {
-			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
-				c.closeWriteAndWait()
-			}
-			return
-		}
-		c.setState(c.rwc, StateIdle)
-		c.curReq.Store((*response)(nil))
-
-		if !w.conn.server.doKeepAlives() {
-			// We're in shutdown mode. We might've replied
-			// to the user without "Connection: close" and
-			// they might think they can send another
-			// request, but such is life with HTTP/1.1.
-			return
-		}
-
-		if d := c.server.idleTimeout(); d != 0 {
-			c.rwc.SetReadDeadline(time.Now().Add(d))
-			if _, err := c.bufr.Peek(4); err != nil {
-				return
-			}
-		}
-		c.rwc.SetReadDeadline(time.Time{})
+		// ...
 	}
 }
 ```
 
 
-TODO(zouying): 分析上面这段代码，如何serve一个连接。
+首先conn对于对于`c.r`进行封装成`connReader`，这个就是一个io.Reader的一个封装实现。`connReader`在Read的时候，做了一些特殊的处理。这里暂时跳过。
+
+c.bufr就是一个带缓存的Reader，下面其实就是用了bufio.Reader来封装。另外这里的缓存使用了sync.Pool来保存cache，这里可以看到底层的源码使用了很多技巧。sync.Pool我在百度工作的时候，因为需要处理的业务量较大，集群200w QPS，单台4-5w QPS，当时也在很多地方用来sync.Pool和bytes.Buffer做性能优化。
+
+> 另外需要在这里说一些自己的感悟，如果我自己之前没有做过对性能优化相关的工作的话，那么我自己看这段源码可能也是一扫而过，知道在这里用了sync.Pool，但是sync.Pool到底起到什么作用（避免频繁分配内存导致的性能下降），可能从根本上还是没有那么透彻，看来技能还是得多多打磨。
+
+接着分析是，使用for循环一直从conn中读出请求，然后进行处理。从代码猜的是，看来请求并不是一次都能读取完毕，可能会多次读取。
+
+在这里出现了把我们最初定义的server封装成一个`serverHandler`的类型，该类型其实就是一个server的Handler或者DefaultServeMux，在serverHandler的`ServeHTTP(w, w.req)`函数定义如下，
+
+```go
+func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+	handler := sh.srv.Handler
+	if handler == nil {
+		handler = DefaultServeMux
+	}
+	if req.RequestURI == "*" && req.Method == "OPTIONS" {
+		handler = globalOptionsHandler{}
+	}
+	handler.ServeHTTP(rw, req)
+}
+```
+
+可以在这里面看到，如果我们最开始的时候，server中的Handler如果是nil的话，就使用默认的DefaultServeMux。
+
+我们在demo中，使用`http.ListenAndServe(":8080", nil)`启动服务时，第二个参数就是nil，所以我们在demo中，用到的就是默认的DefaultServeMux。
+
+那么最后当调用`handler.ServeHTTP(rw, req)`时，DefaultServeMux.ServeHTTP会如何处理这些请求呢？
+
+我们可以看到DefaultServeMux的定义是：
+
+```go
+// DefaultServeMux is the default ServeMux used by Serve.
+var DefaultServeMux = &defaultServeMux
+
+var defaultServeMux ServeMux
+```
+
+其中`ServeMux`的定义是：
+
+```go
+type ServeMux struct {
+	mu    sync.RWMutex
+	m     map[string]muxEntry
+	hosts bool // whether any patterns contain hostnames
+}
+```
+
+我们这样就找到之前所解释的`ServeMux`的调用的地方了，也就是我们终于找到了我们想要分析的路由router的入口点了。
+
+那么我们继续分析ServeMux.ServeHTTP都是如何做的。
+
+```go
+// ServeHTTP dispatches the request to the handler whose
+// pattern most closely matches the request URL.
+func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
+	// ...
+	h, _ := mux.Handler(r)
+	h.ServeHTTP(w, r)
+}
+```
+
+啊哈，起码从注释中，我们可以看到ServeHTTP是把请求分发给最适配的处理函数。
+
+这就是我们要分析的关键所在。
+
+重点在于最后两句：
+
+1. `h, _ := mux.Handler(r)`：返回一个Handler（Handler的定义是：A Handler responds to an HTTP request.），Handler就是对HTTP请求进行处理并作出返回的函数。
+
+```go
+// Handler returns the handler to use for the given request,
+// consulting r.Method, r.Host, and r.URL.Path. It always returns
+// a non-nil handler. 
+func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
+	// ...
+	return mux.handler(host, r.URL.Path)
+}
+```
+
+我们暂时不考虑HTTP CONNECT METHOD，剩下的主要的是`mux.handler(host, r.URL.Path)`。
+
+
+```go
+// handler is the main implementation of Handler.
+// The path is known to be in canonical form, except for CONNECT methods.
+func (mux *ServeMux) handler(host, path string) (h Handler, pattern string) {
+	mux.mu.RLock()
+	defer mux.mu.RUnlock()
+
+	// Host-specific pattern takes precedence over generic ones
+	if mux.hosts {
+		h, pattern = mux.match(host + path)
+	}
+	if h == nil {
+		h, pattern = mux.match(path)
+	}
+	if h == nil {
+		h, pattern = NotFoundHandler(), ""
+	}
+	return
+}
+```
+
+做了下面操作，
+
+1. 看mux中有没有指定hosts需要匹配满足的，如果需要，那么查找的时候，在路径前面添加host，这个host是请求的Host。如果找到匹配的Handler，那么返回该Handler。
+
+2. 如果第1步没有找到。则去掉host，查找是否有匹配的Handler，如果有，返回。
+
+3. 如果没有匹配的，那么返回一个特殊的Handler——NotFoundHandler()，该Handler的定义如下，也就是往Response中写入404。
+
+```go
+// NotFound replies to the request with an HTTP 404 not found error.
+func NotFound(w ResponseWriter, r *Request) { Error(w, "404 page not found", StatusNotFound) }
+
+// NotFoundHandler returns a simple request handler
+// that replies to each request with a ``404 page not found'' reply.
+func NotFoundHandler() Handler { return HandlerFunc(NotFound) }
+```
+
+
+我们往下分析path匹配的函数，`h, pattern = mux.match(path)`
+
+```go
+// Find a handler on a handler map given a path string.
+// Most-specific (longest) pattern wins.
+func (mux *ServeMux) match(path string) (h Handler, pattern string) {
+	// Check for exact match first.
+	v, ok := mux.m[path]
+	if ok {
+		return v.h, v.pattern
+	}
+
+	// Check for longest valid match.
+	var n = 0
+	for k, v := range mux.m {
+		if !pathMatch(k, path) {
+			continue
+		}
+		if h == nil || len(k) > n {
+			n = len(k)
+			h = v.h
+			pattern = v.pattern
+		}
+	}
+	return
+}
+```
+
+从mux中，也即默认的DefaultServeMux，注册Handler map表中搜索，根据一个符合的返回。如果有多个handler都符合，那么返回path匹配最长路径的handler。
+
+> 在这里我们可以看到http默认的mux是不区分http方法的，所以只要路径满足，不管request method是get、post、delete，都是会进入到同一个Handler中。
+
+
+前面的流程串一下就是：
+
+1. 我们启动服务并监听一个地址，等待请求
+
+2. 当来了一个请求后，我们会启动一个goroutine对这个请求进行处理
+
+3. 处理的这个请求的方式，也即我们是怎么查找这个请求的对应的处理函数是根据Handler.ServeHTTP来规定的，这个也就是我们要找的router。
+
+4. 由于我们没有定义自己的router，所以我们使用了默认的DefaultServeMux
+
+5. 从DefaultServeMux注册的所有Handler中，找出最合适Handler进行处理（匹配且路径最长）
