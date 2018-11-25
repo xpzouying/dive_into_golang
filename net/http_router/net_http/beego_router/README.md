@@ -1,6 +1,6 @@
 # dive into beego/router
 
-上一次分析了默认的http sever以及router的工作方式。
+上一次分析了默认的http server以及router的工作方式。
 
 具体参见：
 
@@ -32,3 +32,187 @@ go build hello.go
 ![beego_router_1.jpg](images/beego_router_1.jpg)
 
 
+从之前对于默认的http router可以推测到beego对于查找不到的路由handler也会进行默认的处理，与go默认的不同是，
+
+默认的只是返回一个404错误和一个字符串，"404 page not found"。
+
+```go
+// NotFound replies to the request with an HTTP 404 not found error.
+func NotFound(w ResponseWriter, r *Request) { Error(w, "404 page not found", StatusNotFound) }
+
+// NotFoundHandler returns a simple request handler
+// that replies to each request with a ``404 page not found'' reply.
+func NotFoundHandler() Handler { return HandlerFunc(NotFound) }
+```
+
+而beego会返回一个HTML页面。
+
+具体的是如何实现的，我们后面分析代码的时候会追踪到。
+
+首先分析`beego.Run()`，看看beego.Run()在做什么？
+
+> 猜测：
+> beego.Run()在底层至少包括下面两步：
+> 1. 创建了默认的router，其中包括一个NotFoundHandler来处理404错误；从上一次分析http router可以得知，
+> router肯定会满足http中的ServeHTTP interface，这样才能满足对应的Handler规范。
+> 2. 启动HTTP service，监听socket地址，当接收到请求的时候，调用对应的handler进行处理；
+
+下面分析源码：
+
+```go
+// Run beego application.
+// beego.Run() default run on HttpPort
+// beego.Run("localhost")
+// beego.Run(":8089")
+// beego.Run("127.0.0.1:8089")
+func Run(params ...string) {
+
+	initBeforeHTTPRun()
+    // ...
+	BeeApp.Run()
+}
+```
+
+主要包括两部分：
+
+1. `initBeforeHTTPRun()`
+
+2. `BeeApp.Run()`
+
+
+先看第1部分，在运行http server之前做了一些行为的处理。深入进去看看都是做了什么？
+
+```go
+func initBeforeHTTPRun() {
+	//init hooks
+	AddAPPStartHook(
+		registerMime,
+		registerDefaultErrorHandler,
+		registerSession,
+		registerTemplate,
+		registerAdmin,
+		registerGzip,
+	)
+
+	for _, hk := range hooks {
+		if err := hk(); err != nil {
+			panic(err)
+		}
+	}
+}
+```
+
+做了一大堆的hook，这些hook是什么呢？从后面for循环中可以看出是一个接口规范，在启动前会注册一大堆的参数或者配置，
+其中有一个`registerDefaultErrorHandler`，应该就是我们要找的404页面的Handler处理函数。
+
+我们以这个处理函数的hook为例，看看都在http server运行前都在做什么？
+
+```go
+// register default error http handlers, 404,401,403,500 and 503.
+func registerDefaultErrorHandler() error {
+	m := map[string]func(http.ResponseWriter, *http.Request){
+		"401": unauthorized,
+		"402": paymentRequired,
+		"403": forbidden,
+		"404": notFound,
+		"405": methodNotAllowed,
+		"500": internalServerError,
+		"501": notImplemented,
+		"502": badGateway,
+		"503": serviceUnavailable,
+		"504": gatewayTimeout,
+		"417": invalidxsrf,
+		"422": missingxsrf,
+	}
+	for e, h := range m {
+		if _, ok := ErrorMaps[e]; !ok {
+			ErrorHandler(e, h)
+		}
+	}
+	return nil
+}
+```
+
+为4xx、5xx做了预先定义了一大堆的http HandleFunc，我们还是看我们的404错误的处理函数：notFound，
+
+```go
+// show 404 not found error.
+func notFound(rw http.ResponseWriter, r *http.Request) {
+	responseError(rw, r,
+		404,
+		"<br>The page you have requested has flown the coop."+
+			"<br>Perhaps you are here because:"+
+			"<br><br><ul>"+
+			"<br>The page has moved"+
+			"<br>The page no longer exists"+
+			"<br>You were looking for your puppy and got lost"+
+			"<br>You like 404 pages"+
+			"</ul>",
+	)
+}
+
+func responseError(rw http.ResponseWriter, r *http.Request, errCode int, errContent string) {
+	t, _ := template.New("beegoerrortemp").Parse(errtpl)
+	data := M{
+		"Title":        http.StatusText(errCode),
+		"BeegoVersion": VERSION,
+		"Content":      template.HTML(errContent),
+	}
+	t.Execute(rw, data)
+}
+```
+
+
+首先按照HandleFunc interface的规范，定义了`notFound`的处理函数，这个函数使用template库渲染了html页面。
+
+我们最开始打开的404页面就是由该处理函数进行渲染得到的。
+
+在`registerDefaultErrorHandler`中其他的错误处理函数也是类似，使用http template渲染了不同的html页面。
+
+下面这段for循环代码，是刚才那一堆默认的error handler注册到ErrorMaps上面。如果用户定义了自己的错误处理函数，那么使用用户自己定义的，否则使用beego自带的。
+
+```go
+	for e, h := range m {
+		if _, ok := ErrorMaps[e]; !ok { // 如果用户没有定义，则使用beego自带的错误处理函数
+			ErrorHandler(e, h)
+		}
+	}
+```
+
+`ErrorMaps`是什么呢？
+
+```go
+// ErrorMaps holds map of http handlers for each error string.
+// there is 10 kinds default error(40x and 50x)
+var ErrorMaps = make(map[string]*errorInfo, 10)
+
+// ErrorHandler registers http.HandlerFunc to each http err code string.
+// usage:
+// 	beego.ErrorHandler("404",NotFound)
+//	beego.ErrorHandler("500",InternalServerError)
+func ErrorHandler(code string, h http.HandlerFunc) *App {
+	ErrorMaps[code] = &errorInfo{
+		errorType: errorTypeHandler,
+		handler:   h,
+		method:    code,
+	}
+	return BeeApp
+}
+```
+
+ErrorMaps是一个默认的查找错误的处理函数的表，这也是router mux的一部分，只是它专门用来查找错误的HandleFunc。
+
+ErrorHandler函数在注册完后，返回一个BeeApp，其类型为`*App`，看起来BeeApp就是咱们要找的默认的http server以及handler集合了。
+
+```go
+var (
+	// BeeApp is an application instance
+	BeeApp *App
+)
+
+// App defines beego application with a new PatternServeMux.
+type App struct {
+	Handlers *ControllerRegister
+	Server   *http.Server
+}
+```
