@@ -216,3 +216,20 @@ type App struct {
 	Server   *http.Server
 }
 ```
+
+
+再分析其他的Hook都是干什么？
+
+- `registerMime`：注册一大堆的文件与文件在HTTP Header上Content-Type对应关系，比如`".json"`注册为`"application/json"`。
+
+- `registerDefaultErrorHandler`：注册错误的处理函数
+
+- `registerSession`：跳过。
+
+- `registerTemplate`：跳过。
+
+- `registerAdmin`：跳过。
+
+- `registerGzip`：跳过。
+
+
