@@ -218,7 +218,7 @@ type App struct {
 ```
 
 
-再分析其他的Hook都是干什么？
+再分析其他的Hook都是干什么？大部分暂时跳过，我们主要是要找到运行的原理，暂时不纠结细节处理。
 
 - `registerMime`：注册一大堆的文件与文件在HTTP Header上Content-Type对应关系，比如`".json"`注册为`"application/json"`。
 
@@ -233,3 +233,68 @@ type App struct {
 - `registerGzip`：跳过。
 
 
+接下来看看初始化完后，http service是如何启动并且找到对应的handler的？
+
+重点看BeeApp，App struct中包括两个，
+
+1. `Handlers *ControllerRegister`
+
+2. `Server   *http.Server`
+
+
+`BeeApp.Run()`启动后，
+
+
+```go
+// MiddleWare function for http.Handler
+type MiddleWare func(http.Handler) http.Handler
+
+// Run beego application.
+func (app *App) Run(mws ...MiddleWare) {
+	addr := BConfig.Listen.HTTPAddr
+
+	if BConfig.Listen.HTTPPort != 0 {
+		addr = fmt.Sprintf("%s:%d", BConfig.Listen.HTTPAddr, BConfig.Listen.HTTPPort)
+	}
+
+	var (
+		err        error
+		l          net.Listener
+		endRunning = make(chan bool, 1)
+	)
+    // ...
+	if BConfig.Listen.EnableHTTP {
+		go func() {
+			app.Server.Addr = addr
+			logs.Info("http server Running on http://%s", app.Server.Addr)
+			if BConfig.Listen.ListenTCP4 {
+				ln, err := net.Listen("tcp4", app.Server.Addr)
+				// ...
+				if err = app.Server.Serve(ln); err != nil {
+					// ...
+					endRunning <- true
+					return
+				}
+			} // ...
+		}()
+	}
+	<-endRunning
+}
+```
+
+
+暂时跳过MiddleWare相关，后面专门分析MiddleWare相关知识点。
+
+我们查看普通的http模式，进入到`if BConfig.Listen.EnableHTTP`分支，并且我们假设仅仅监听tcp ipv4，而不监听ipv6。
+
+在这里面起了一个goroutine运行，然后在整个函数的最后使用endRunning的channel等待goroutine的工作完毕。
+
+goroutine中做了什么事情？
+
+1. 使用net.Listen做了一个tcp v4的监听；
+
+2. 使用app中的Server对这个连接进行处理(Serve)；Serve会从监听的listen接收到进来的请求，然后创建一个新的goroutine去执行。在goroutine中，服务器端会读取request的信息，并且找到对应的srv.Handler去处理请求。
+
+> TODO：
+> 不清楚为什么在Run()里面需要起一个goroutine来接收/处理请求。
+> 我的感觉是不需要用goroutine，也不需要endRunning channel来阻塞。在Serve(ln)中，已经包括一个for的死循环了，程序不会结束退出。
