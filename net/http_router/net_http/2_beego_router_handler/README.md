@@ -211,3 +211,122 @@ func (p *ControllerRegister) AddMethod(method, pattern string, f FilterFunc) {
 
 2. 注册新建的route，`p.addToRouter(k, pattern, route)`，在当前行为下，其实就是：`p.addToRouter("get", "/", route)`
 
+3. addToRouter中可以看到对于每一种method，都是各自的一个Tree。这个跟http default mux有区别，在default mux中，所有的方法都同时引导到同一个handler func中，在那里面对每一种method进行区分。
+
+```go
+func (p *ControllerRegister) addToRouter(method, pattern string, r *ControllerInfo) {
+	if !BConfig.RouterCaseSensitive {
+		pattern = strings.ToLower(pattern)
+	}
+	if t, ok := p.routers[method]; ok {
+		t.AddRouter(pattern, r)
+	} else {
+		t := NewTree()
+		t.AddRouter(pattern, r)
+		p.routers[method] = t
+	}
+}
+
+// AddRouter call addseg function
+func (t *Tree) AddRouter(pattern string, runObject interface{}) {
+	t.addseg(splitPath(pattern), runObject, nil, "")
+}
+
+// "/" -> []
+// "/admin" -> ["admin"]
+// "/admin/" -> ["admin"]
+// "/admin/users" -> ["admin", "users"]
+func splitPath(key string) []string {
+	key = strings.Trim(key, "/ ")
+	if key == "" {
+		return []string{}
+	}
+	return strings.Split(key, "/")
+}
+```
+
+在splitPath中可以看到，在注册路径的时候，按照`/`进行了路径分割，然后保存到了一个`[]string`slice中，注册的形式比较特殊，跟http default mux直接把pattern放进去不同，default mux搜索时做了最长路径匹配的搜索，所以在搜索的过程中做了很多处理用来实现最长路径匹配，这也是导致default mux搜索慢的原因，不知道beego的这种注册方式是不是在优化这个搜索过程，后面分析到搜索的时候，详细看看。
+
+```go
+
+// "/"
+// "admin" ->
+func (t *Tree) addseg(segments []string, route interface{}, wildcards []string, reg string) {
+	if len(segments) == 0 {
+		if reg != "" {
+			t.leaves = append(t.leaves, &leafInfo{runObject: route, wildcards: wildcards, regexps: regexp.MustCompile("^" + reg + "$")})
+		} else {
+			t.leaves = append(t.leaves, &leafInfo{runObject: route, wildcards: wildcards})
+		}
+	} else {
+		seg := segments[0]
+		iswild, params, regexpStr := splitSegment(seg)
+		// if it's ? meaning can igone this, so add one more rule for it
+		if len(params) > 0 && params[0] == ":" {
+			t.addseg(segments[1:], route, wildcards, reg)
+			params = params[1:]
+		}
+		//Rule: /login/*/access match /login/2009/11/access
+		//if already has *, and when loop the access, should as a regexpStr
+		if !iswild && utils.InSlice(":splat", wildcards) {
+			iswild = true
+			regexpStr = seg
+		}
+		//Rule: /user/:id/*
+		if seg == "*" && len(wildcards) > 0 && reg == "" {
+			regexpStr = "(.+)"
+		}
+		if iswild {
+			if t.wildcard == nil {
+				t.wildcard = NewTree()
+			}
+			if regexpStr != "" {
+				if reg == "" {
+					rr := ""
+					for _, w := range wildcards {
+						if w == ":splat" {
+							rr = rr + "(.+)/"
+						} else {
+							rr = rr + "([^/]+)/"
+						}
+					}
+					regexpStr = rr + regexpStr
+				} else {
+					regexpStr = "/" + regexpStr
+				}
+			} else if reg != "" {
+				if seg == "*.*" {
+					regexpStr = "/([^.]+).(.+)"
+					params = params[1:]
+				} else {
+					for range params {
+						regexpStr = "/([^/]+)" + regexpStr
+					}
+				}
+			} else {
+				if seg == "*.*" {
+					params = params[1:]
+				}
+			}
+			t.wildcard.addseg(segments[1:], route, append(wildcards, params...), reg+regexpStr)
+		} else {
+			var subTree *Tree
+			for _, sub := range t.fixrouters {
+				if sub.prefix == seg {
+					subTree = sub
+					break
+				}
+			}
+			if subTree == nil {
+				subTree = NewTree()
+				subTree.prefix = seg
+				t.fixrouters = append(t.fixrouters, subTree)
+			}
+			subTree.addseg(segments[1:], route, wildcards, reg)
+		}
+	}
+}
+```
+
+上面这段代码是如何注册router的详细过程。
+
