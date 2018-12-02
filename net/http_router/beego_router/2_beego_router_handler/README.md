@@ -248,7 +248,6 @@ func splitPath(key string) []string {
 在splitPath中可以看到，在注册路径的时候，按照`/`进行了路径分割，然后保存到了一个`[]string`slice中，注册的形式比较特殊，跟http default mux直接把pattern放进去不同，default mux搜索时做了最长路径匹配的搜索，所以在搜索的过程中做了很多处理用来实现最长路径匹配，这也是导致default mux搜索慢的原因，不知道beego的这种注册方式是不是在优化这个搜索过程，后面分析到搜索的时候，详细看看。
 
 ```go
-
 // "/"
 // "admin" ->
 func (t *Tree) addseg(segments []string, route interface{}, wildcards []string, reg string) {
@@ -329,4 +328,261 @@ func (t *Tree) addseg(segments []string, route interface{}, wildcards []string, 
 ```
 
 上面这段代码是如何注册router的详细过程。
+
+1. 从input分析
+
+   1. segments: 为路径按照`/` split分割后的字符串数组
+   2. route: 为route，里面包含了http handle func
+   3. wildcards: 通配符，nil。如果我们的节点是通配符的话，那么我们会保留我们所有的通配符定义，比如["id" "name"] for the wildcard ":id" and ":name"。
+   4. reg: 为空字符串，表示我们不是一个正则表达式
+
+2. 函数里面按照segments的不同，进行了不同的处理。在第一个注册函数中，我们只是对路径`/`进行了注册，所以在这里的segments的长度也就是0，并且我们的没有使用正则表达式。
+
+   我们在该函数里面仅仅是调用了一行语句：
+
+   ```go
+   			t.leaves = append(t.leaves, &leafInfo{runObject: route, wildcards: wildcards})
+   ```
+
+   我们在Tree的叶子结点上增加了一个叶子结点的信息：`route`，也就是把我们的http handle func的所有信息都传递进去，wildcards为nil，没有通配符。
+
+当该http处理函数注册完成后，启动http server时，我们下面分析查找的过程。
+
+### beego router 搜索过程
+
+调用`BeeApp.Run()`，其实在底层就是调用了http Serve(l)，这其中的过程参考http router的解析，在这里就不再重复。
+
+最后会调用到http/server.go中的下列方法，
+
+```go
+func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+    handler := sh.srv.Handler
+    if handler == nil {
+        handler = DefaultServeMux
+    }
+    if req.RequestURI == "*" && req.Method == "OPTIONS" {
+        handler = globalOptionsHandler{}
+    }
+    handler.ServeHTTP(rw, req)
+}
+```
+
+在http router中解析过该函数，当时由于sh.srv.Handler为nil，所以使用的是默认的DefaultServeMux。
+
+但是在当前beego中，Handler不再为nil，在之前分析过，当前的Handler为`ControllerRegister`类型，所以其实当运行的过程中，接收到一个请求后，会进入到`ControllerRegister.ServeHTTP`方法。
+
+```go
+// Implement http.Handler interface.
+func (p *ControllerRegister) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	var (
+		runRouter    reflect.Type
+		findRouter   bool
+		runMethod    string
+		methodParams []*param.MethodParam
+		routerInfo   *ControllerInfo
+		isRunnable   bool
+	)
+	context := p.pool.Get().(*beecontext.Context)
+	context.Reset(rw, r)
+
+	defer p.pool.Put(context)
+	if BConfig.RecoverFunc != nil {
+		defer BConfig.RecoverFunc(context)
+	}
+
+	context.Output.EnableGzip = BConfig.EnableGzip
+
+	if BConfig.RunMode == DEV {
+		context.Output.Header("Server", BConfig.ServerName)
+	}
+
+	var urlPath = r.URL.Path
+
+	if !BConfig.RouterCaseSensitive {
+		urlPath = strings.ToLower(urlPath)
+	}
+
+	// filter wrong http method
+	if !HTTPMETHOD[r.Method] {
+		http.Error(rw, "Method Not Allowed", 405)
+		goto Admin
+	}
+
+	// filter for static file
+	if len(p.filters[BeforeStatic]) > 0 && p.execFilter(context, urlPath, BeforeStatic) {
+		goto Admin
+	}
+
+	serverStaticRouter(context)
+
+	if context.ResponseWriter.Started {
+		findRouter = true
+		goto Admin
+	}
+
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		// ...
+	}
+
+	// session init
+	if BConfig.WebConfig.Session.SessionOn {
+		// ...
+	}
+	if len(p.filters[BeforeRouter]) > 0 && p.execFilter(context, urlPath, BeforeRouter) {
+		goto Admin
+	}
+	// User can define RunController and RunMethod in filter
+	if context.Input.RunController != nil && context.Input.RunMethod != "" {
+		findRouter = true
+		runMethod = context.Input.RunMethod
+		runRouter = context.Input.RunController
+	} else {
+		routerInfo, findRouter = p.FindRouter(context)
+	}
+
+	//if no matches to url, throw a not found exception
+	if !findRouter {
+		exception("404", context)
+		goto Admin
+	}
+	if splat := context.Input.Param(":splat"); splat != "" {
+		for k, v := range strings.Split(splat, "/") {
+			context.Input.SetParam(strconv.Itoa(k), v)
+		}
+	}
+
+	//execute middleware filters
+	if len(p.filters[BeforeExec]) > 0 && p.execFilter(context, urlPath, BeforeExec) {
+		goto Admin
+	}
+
+	//check policies
+	if p.execPolicy(context, urlPath) {
+		goto Admin
+	}
+
+	if routerInfo != nil {
+		//store router pattern into context
+		context.Input.SetData("RouterPattern", routerInfo.pattern)
+		if routerInfo.routerType == routerTypeRESTFul {
+			if _, ok := routerInfo.methods[r.Method]; ok {
+				isRunnable = true
+				routerInfo.runFunction(context)
+			} else {
+				exception("405", context)
+				goto Admin
+			}
+		} else if routerInfo.routerType == routerTypeHandler {
+			isRunnable = true
+			routerInfo.handler.ServeHTTP(rw, r)
+		} else {
+			runRouter = routerInfo.controllerType
+			methodParams = routerInfo.methodParams
+			method := r.Method
+			if r.Method == http.MethodPost && context.Input.Query("_method") == http.MethodPost {
+				method = http.MethodPut
+			}
+			if r.Method == http.MethodPost && context.Input.Query("_method") == http.MethodDelete {
+				method = http.MethodDelete
+			}
+			if m, ok := routerInfo.methods[method]; ok {
+				runMethod = m
+			} else if m, ok = routerInfo.methods["*"]; ok {
+				runMethod = m
+			} else {
+				runMethod = method
+			}
+		}
+	}
+
+	// also defined runRouter & runMethod from filter
+	if !isRunnable {
+		// ...
+	}
+
+	//execute middleware filters
+	if len(p.filters[AfterExec]) > 0 && p.execFilter(context, urlPath, AfterExec) {
+		goto Admin
+	}
+
+	if len(p.filters[FinishRouter]) > 0 && p.execFilter(context, urlPath, FinishRouter) {
+		goto Admin
+	}
+
+Admin:
+	//admin module record QPS
+
+	statusCode := context.ResponseWriter.Status
+	if statusCode == 0 {
+		statusCode = 200
+	}
+
+	logAccess(context, &startTime, statusCode)
+
+	timeDur := time.Since(startTime)
+	context.ResponseWriter.Elapsed = timeDur
+	if BConfig.Listen.EnableAdmin {
+		// ... 如果启动admin，跳过
+	}
+
+	if BConfig.RunMode == DEV && !BConfig.Log.AccessLogs {
+		// ... 如果是开发模式，跳过
+	}
+	// Call WriteHeader if status code has been set changed
+	if context.Output.Status != 0 {
+		context.ResponseWriter.WriteHeader(context.Output.Status)
+	}
+}
+
+// Reset init Context, BeegoInput and BeegoOutput
+func (ctx *Context) Reset(rw http.ResponseWriter, r *http.Request) {
+    ctx.Request = r
+    if ctx.ResponseWriter == nil {
+        ctx.ResponseWriter = &Response{}
+    }
+    ctx.ResponseWriter.reset(rw)
+    ctx.Input.Reset(ctx)
+    ctx.Output.Reset(ctx)
+    ctx._xsrfToken = ""
+}
+```
+
+
+
+1. `context(beecontext.Context)`使用了sync.Pool做cache优化。每次在调用`Reset`时，把请求的`http.ResponseWriter`和`http.Request`传给context。
+2. 定义了`RecoverFunc`用来恢复用。这个还比较感兴趣，记下TODO以后分析。
+3. method的请求方法如果beego不支持，则会写405，Method Not Allowed错误，不过大部分http method都支持。
+4. 搜索对应的router，调用的是`routerInfo, findRouter = p.FindRouter(context)`，后面详细分析。
+5. 我们当前的请求为：`curl -X GET http://localhost:8080`，我们是可以找到对应的router。所以我们进入`if routerInfo != nil`分支中分析。我们在注册的时候，使用的是`route.routerType = routerTypeRESTFul`，所以我们我们会得到两个部分：
+   1. `isRunnable = true`
+   2. `routerInfo.runFunction(context)`：这里就是调用到了我们定义的HandleFunc了，我们只是简单的进行了简单的输出`ctx.Output.Body([]byte("hello world"))`。
+6. 由于我们当前的isRunnable是true，所以if分支里面的一大坨代码暂时跳过。后面的代码也暂时跳过。分析之前省略的如何搜索到对应的router。
+
+
+
+#### 如何搜索找到对应的router
+
+```go
+// FindRouter Find Router info for URL
+func (p *ControllerRegister) FindRouter(context *beecontext.Context) (routerInfo *Controller
+Info, isFind bool) {
+    var urlPath = context.Input.URL()
+    if !BConfig.RouterCaseSensitive {
+        urlPath = strings.ToLower(urlPath)
+    }
+    httpMethod := context.Input.Method()
+    if t, ok := p.routers[httpMethod]; ok {
+        runObject := t.Match(urlPath, context)
+        if r, ok := runObject.(*ControllerInfo); ok {
+            return r, true
+        }
+    }
+    return
+}
+```
+
+
+
+由于我们把http request的信息都放到了beego.context中的Input了，所以我们从context中找到请求的所有信息。这里我们需要根据request的url和method进行router的搜索匹配。
 
