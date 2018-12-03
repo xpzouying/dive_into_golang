@@ -211,7 +211,7 @@ func (p *ControllerRegister) AddMethod(method, pattern string, f FilterFunc) {
 
 2. 注册新建的route，`p.addToRouter(k, pattern, route)`，在当前行为下，其实就是：`p.addToRouter("get", "/", route)`
 
-3. addToRouter中可以看到对于每一种method，都是各自的一个Tree。这个跟http default mux有区别，在default mux中，所有的方法都同时引导到同一个handler func中，在那里面对每一种method进行区分。
+3. addToRouter中可以看到对于每一种method，都是各自的一个Tree。这个跟http default mux有区别，在default mux中，所有的方法都同时引导到同一个handler func中，在那里面对每一种method进行区分。在beego中，是使用了一个map进行保存不同method请求的router，保存在`type ControllerRegister struct`中的`routers map[string]*Tree`成员中，key是method，*Tree就是一颗ControllerRegister信息的树。
 
 ```go
 func (p *ControllerRegister) addToRouter(method, pattern string, r *ControllerInfo) {
